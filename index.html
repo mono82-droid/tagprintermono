@@ -38,10 +38,21 @@
       <div id="guideX" class="guide x" hidden></div>
       <div id="guideY" class="guide y" hidden></div>
     </div>
+    <button id="sizeChip" class="sizechip" type="button">40×60mm ▾</button>
   </section>
+
+  <!-- 글자 크기: 세로 화면에서도 항상 보이게 라벨 바로 아래 고정 -->
+  <div id="quick" hidden>
+    <button id="qMinus" class="btn outline" type="button">A−</button>
+    <input id="qSize" type="range" min="2" max="160" step="1" aria-label="글자 크기">
+    <button id="qPlus" class="btn outline" type="button">A+</button>
+    <span id="qVal">12.0mm</span>
+    <button id="qFill" class="btn tonal" type="button">꽉</button>
+  </div>
 
   <!-- 가운데(스크롤): 편집 도구 + 속성 -->
   <main id="mid">
+    <div class="card" id="props"></div>
     <div class="card">
       <div class="sec first">라벨 종류</div>
       <div class="row" id="typeRow">
@@ -65,7 +76,6 @@
         <button class="btn danger" id="del" type="button">삭제</button>
       </div>
     </div>
-    <div class="card" id="props"></div>
     <div class="foot">택번호 프린터 · 아이폰은 Bluefy 앱에서 열어야 블루투스 프린터에 연결됩니다</div>
   </main>
 

@@ -766,13 +766,14 @@ let scale = 1;
 
 function fitPaper() {
   const W = tpl.widthMm * DOTS, H = tpl.heightMm * DOTS, st = $('#stage');
+  $('#sizeChip').textContent = `라벨 ${tpl.widthMm}×${tpl.heightMm}mm ▾`;
   scale = Math.max(0.1, Math.min((st.clientWidth - 24) / W, (st.clientHeight - 24) / H));
   cv.style.width = (W * scale) + 'px'; cv.style.height = (H * scale) + 'px';
 }
 function redraw() {
   if (!tpl) return;
   render(tpl, S.nextNumber, previewFit(), cv);
-  fitPaper(); drawSel();
+  fitPaper(); drawSel(); updateQuick();
   schedulePrepare();
 }
 function drawSel() {
@@ -895,9 +896,35 @@ function editInline(e) {
   if (first) { first.focus(); if (first.select && e.type !== 'TEXT') first.select(); }
 }
 
+// ═══════════════════════════ 글자 크기 고정 줄 ═══════════════════════════
+
+function updateQuick() {
+  const q = $('#quick'), e = tpl && tpl.elements[selIdx];
+  if (!e) { q.hidden = true; return; }
+  q.hidden = false;
+  $('#qSize').value = Math.round(e.sizeMm * 2);
+  const real = effectiveSizeMm(tpl, e, S.nextNumber, previewFit());
+  const v = $('#qVal'); v.innerHTML = '';
+  v.append(`${e.sizeMm.toFixed(1)}mm`);
+  if (real < e.sizeMm - 0.05) v.append(h('small', {}, `맞춤 ${real.toFixed(1)}`));   // 라벨에 맞춰 줄어든 실제 크기
+}
+function quickStep(d) {
+  const e = tpl.elements[selIdx]; if (!e) return;
+  e.sizeMm = clamp(Math.round((e.sizeMm + d) * 2) / 2, 1, 80);
+  changed(); buildProps();
+}
+function quickFill() {
+  const e = tpl.elements[selIdx]; if (!e) return;
+  e.sizeMm = 80;
+  e.sizeMm = Math.floor(effectiveSizeMm(tpl, e, S.nextNumber, previewFit()) * 10) / 10;
+  if (e.centerH && !e.centerV) center(tpl, e, false, true, S.nextNumber, previewFit());
+  changed(); buildProps();
+}
+
 // ═══════════════════════════ 속성 패널 ═══════════════════════════
 
 function buildProps() {
+  updateQuick();
   const box = $('#props'); box.innerHTML = '';
   const e = tpl.elements[selIdx];
   if (!e) {
@@ -950,12 +977,7 @@ function buildProps() {
   showSize();
   box.append(
     h('div', { class: 'row', style: 'margin-top:4px' }, h('div', { class: 'lbl' }, '글자 크기'),
-      btn('라벨에 꽉 채우기', 'tonal', () => {
-        e.sizeMm = 80;   // 최대로 키운 뒤 라벨 안에 들어가는 실제 크기로 고정
-        e.sizeMm = Math.floor(effectiveSizeMm(tpl, e, S.nextNumber, previewFit()) * 10) / 10;
-        if (e.centerH) center(tpl, e, false, true, S.nextNumber, previewFit());
-        changed(); buildProps();
-      })),
+      btn('라벨에 꽉 채우기', 'tonal', quickFill)),
     h('div', { class: 'row' }, btn('−', 'outline', () => step(-0.5)), h('div', { style: 'flex:3 1 0' }, bar), btn('+', 'outline', () => step(0.5)), val));
 
   // 장평
@@ -1322,6 +1344,15 @@ function toast(msg) {
 function wire() {
   $('#status').addEventListener('click', printerMenu);
   $('#gear').addEventListener('click', settingsSheet);
+  $('#sizeChip').addEventListener('click', labelSizeSheet);
+  $('#qMinus').addEventListener('click', () => quickStep(-1));
+  $('#qPlus').addEventListener('click', () => quickStep(1));
+  $('#qFill').addEventListener('click', quickFill);
+  $('#qSize').addEventListener('input', () => {
+    const e = tpl.elements[selIdx]; if (!e) return;
+    e.sizeMm = int($('#qSize').value) / 2; redraw();
+  });
+  $('#qSize').addEventListener('change', () => { saveTpl(); updatePrintUI(); buildProps(); });
   $('#undo').addEventListener('click', undo);
   $('#redo').addEventListener('click', redo);
   $('#recent').addEventListener('click', historySheet);

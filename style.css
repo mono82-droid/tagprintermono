@@ -67,16 +67,32 @@ h1 { flex: 1; margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.2p
 
 /* ── 라벨 편집 영역 */
 #stage {
-  flex: none; height: 34vh; min-height: 210px; max-height: 300px;
+  flex: none; height: 32vh; min-height: 190px; max-height: 300px;
   background: var(--canvas); display: flex; align-items: center; justify-content: center;
   position: relative; touch-action: none;
 }
 #paper { position: relative; background: #fff; box-shadow: 3px 3px 0 rgba(0,0,0,.08); outline: 1px solid #C9CED6; }
 #label { display: block; image-rendering: pixelated; touch-action: none; }
+.sizechip {
+  position: absolute; right: 10px; bottom: 10px; border: 1px solid var(--line); background: rgba(255,255,255,.92);
+  border-radius: 14px; padding: 6px 10px; font-size: 12px; font-weight: 700; color: var(--text); cursor: pointer;
+}
+.sizechip:active { background: var(--primary-soft); }
 #sel { position: absolute; border: 2px dashed var(--primary); pointer-events: none; border-radius: 2px; }
 .guide { position: absolute; background: rgba(233,30,99,.5); pointer-events: none; }
 .guide.x { width: 2px; top: 0; bottom: 0; }
 .guide.y { height: 2px; left: 0; right: 0; }
+
+/* ── 글자 크기 고정 줄 */
+#quick {
+  flex: none; display: flex; align-items: center; gap: 6px; background: var(--surface);
+  padding: 6px 12px; border-bottom: 1px solid var(--line); position: relative; z-index: 1;
+}
+#quick .btn { flex: none; min-height: 38px; height: 38px; width: 44px; padding: 0; font-size: 14px; }
+#quick #qFill { width: 48px; }
+#quick input { flex: 1; min-width: 0; }
+#qVal { flex: none; min-width: 58px; text-align: center; font-size: 13px; font-weight: 700; line-height: 1.15; }
+#qVal small { display: block; color: var(--primary); font-size: 10.5px; font-weight: 600; }
 
 /* ── 가운데 */
 #mid { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 12px 12px 20px; }
