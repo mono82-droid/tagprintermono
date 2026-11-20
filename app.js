@@ -746,17 +746,34 @@ function defaultTpl() {
   t.elements.push(e); center(t, e, true, true, 1);
   return t;
 }
-function labelSizeSheet() {
+/** 라벨 크기 바꾸기. all=true 면 모든 탭에 같은 크기 */
+function applyLabelSize(w, hh, g, all) {
+  const W = clamp(int(w, tpl.widthMm), 10, 76), H = clamp(int(hh, tpl.heightMm), 10, 200), G = clamp(int(g, tpl.gapMm), 0, 10);
+  if (all) {
+    for (const n of orderedTabs()) {
+      if (n === tpl.name) continue;
+      const t = store.load(n); if (!t) continue;
+      t.widthMm = W; t.heightMm = H; t.gapMm = G; store.save(t);
+    }
+  }
+  tpl.widthMm = W; tpl.heightMm = H; tpl.gapMm = G;
+  saveTpl(); bindTemplate();
+  toast(`라벨 ${W}×${H}mm, 간격 ${G}mm` + (all ? ' — 모든 탭에 적용' : ''));
+}
+/** 라벨 크기 입력칸 묶음 (설정 창과 라벨 크기 창에서 같이 씀) */
+function labelSizeFields() {
   const w = numInput(tpl.widthMm), hh = numInput(tpl.heightMm), g = numInput(tpl.gapMm);
-  openSheet('라벨 크기', h('div', {},
+  const box = h('div', {},
     h('div', { class: 'row' }, field('가로 mm', w), field('세로 mm', hh), field('간격 mm', g)),
-    h('div', { class: 'hint' }, 'XP-365B 최대 인쇄 폭 76mm. 간격은 라벨 사이 빈칸(보통 2mm).')),
-    [btn('취소', 'outline', closeSheet), btn('적용', 'primary', () => {
-      tpl.widthMm = clamp(int(w.value, tpl.widthMm), 10, 76);
-      tpl.heightMm = clamp(int(hh.value, tpl.heightMm), 10, 200);
-      tpl.gapMm = clamp(int(g.value, tpl.gapMm), 0, 10);
-      closeSheet(); saveTpl(); bindTemplate();
-    })]);
+    h('div', { class: 'hint' }, 'XP-365B 최대 인쇄 폭 76mm. 간격은 라벨 사이 빈칸(보통 2mm).'));
+  return { box, w, hh, g };
+}
+
+function labelSizeSheet() {
+  const f = labelSizeFields();
+  openSheet(`라벨 크기 — '${tpl.name}' 탭`, f.box, [
+    btn('모든 탭에', 'tonal', () => { closeSheet(); applyLabelSize(f.w.value, f.hh.value, f.g.value, true); }),
+    btn('이 탭에 적용', 'primary', () => { closeSheet(); applyLabelSize(f.w.value, f.hh.value, f.g.value, false); })]);
 }
 
 // ═══════════════════════════ 편집 영역 (캔버스) ═══════════════════════════
@@ -1245,8 +1262,14 @@ function settingsSheet() {
     i.addEventListener('input', () => { const v = int(i.value, NaN); if (Number.isFinite(v)) { S[key] = v; saveS(); } });
     return i;
   };
+  const lf = labelSizeFields();
   const body = h('div', {},
-    sec('인쇄', true),
+    sec(`라벨 크기 — '${tpl.name}' 탭`, true),
+    lf.box,
+    h('div', { class: 'row' },
+      btn('이 탭에 적용', 'primary', () => { applyLabelSize(lf.w.value, lf.hh.value, lf.g.value, false); }),
+      btn('모든 탭에 적용', 'tonal', () => { applyLabelSize(lf.w.value, lf.hh.value, lf.g.value, true); })),
+    sec('인쇄'),
     h('div', { class: 'row' }, field('농도 (0~15)', num('density')), field('속도 (1~6)', num('speed'))),
     h('div', { class: 'row' }, field('가로 보정 (dot)', num('offsetX', true)), field('세로 보정 (dot)', num('offsetY', true))),
     switchRow('출력 방향 180° 뒤집기', S.flip180, v => { S.flip180 = v; saveS(); }),
