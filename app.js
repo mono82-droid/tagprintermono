@@ -376,7 +376,13 @@ function tsplJob(t, cv, copies, header = true) {
 
 // ═══════════════════════════ 프린터 (Web Bluetooth) ═══════════════════════════
 
-const P = { device: null, ch: null, canResp: false, canNR: false, connecting: null };
+const P = {
+  device: null, ch: null, canResp: false, canNR: false, connecting: null,
+  stale: false,        // 다시 붙이기에 실패한 상태 → 다음 [인쇄] 때 고르기 창(한 번 연결했던 프린터만)
+  needAdvert: false,   // 오래 끊겨 있던 기기: 광고 신호를 먼저 받아야 붙는 브라우저가 있음
+  userClosed: false,   // 사용자가 '연결 끊기'를 누름 → 자동 연결 안 함
+  retryTimer: 0, retryPending: false, retryDelay: 1500,
+};
 let manualClose = false;
 
 const bleSupported = () => !!(navigator.bluetooth && navigator.bluetooth.requestDevice);
@@ -385,22 +391,31 @@ function setStatus(kind, text) {
   $('#statusText').textContent = text;
 }
 const isConnected = () => !!(P.ch && P.device && P.device.gatt && P.device.gatt.connected);
+const devName = () => (P.device && P.device.name) || S.deviceName || '프린터';
 function withTimeout(p, ms, msg) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 }
 
-/** 프린터 고르기 — 반드시 버튼 누른 직후(다른 await 전에) 불러야 브라우저가 허용 */
-async function pickPrinter() {
+/**
+ * 프린터 고르기 — 반드시 버튼 누른 직후(다른 await 전에) 불러야 브라우저가 허용.
+ * 한 번 연결했던 프린터가 있으면 그 이름만 목록에 떠서 한 번에 고름. any=true 면 전부.
+ */
+async function pickPrinter(any = false) {
   if (!bleSupported()) { showNoBle(); return false; }
+  const optionalServices = KNOWN.map(k => k[0]);
+  const opts = (!any && S.deviceName)
+    ? { filters: [{ name: S.deviceName }], optionalServices }
+    : { acceptAllDevices: true, optionalServices };
   let dev;
   try {
-    dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: KNOWN.map(k => k[0]) });
+    dev = await navigator.bluetooth.requestDevice(opts);
   } catch (e) {
     if (!e || e.name !== 'NotFoundError') toast('프린터 선택 실패: ' + (e && e.message || e));
     return false;   // NotFoundError = 고르지 않고 닫음
   }
+  P.userClosed = false; P.stale = false; P.needAdvert = false;
   attachDevice(dev);
-  S.deviceId = dev.id || null; S.deviceName = dev.name || null; saveS();
+  S.deviceId = dev.id || null; S.deviceName = dev.name || S.deviceName || null; saveS();
   return connect();
 }
 
@@ -411,15 +426,28 @@ function attachDevice(dev) {
   dev.addEventListener('gattserverdisconnected', onDisconnected);
 }
 
+/** 광고 신호를 잠깐 기다림 (지원하는 브라우저만) — 오래 끊겨 있던 기기에 바로 붙으면 '범위 밖' 오류가 나는 경우 대비 */
+async function waitAdvert(dev, ms = 6000) {
+  if (!dev || typeof dev.watchAdvertisements !== 'function') return;
+  const ac = typeof AbortController === 'function' ? new AbortController() : null;
+  await new Promise(res => {
+    const done = () => { clearTimeout(timer); try { ac && ac.abort(); } catch (_) {} res(); };
+    const timer = setTimeout(done, ms);
+    dev.addEventListener('advertisementreceived', done, { once: true });
+    Promise.resolve(dev.watchAdvertisements(ac ? { signal: ac.signal } : undefined)).catch(done);
+  });
+}
+
 /** 연결 + 쓰기 채널 찾기. 알려진 UUID 부터, 없으면 허용된 서비스 안의 아무 쓰기 특성 */
 function connect() {
   if (!P.device) return Promise.resolve(false);
   if (isConnected()) return Promise.resolve(true);
   if (P.connecting) return P.connecting;
   P.connecting = (async () => {
-    const name = P.device.name || '프린터';
+    const name = devName();
     setStatus('busy', `${name} 연결 중…`);
     try {
+      if (P.needAdvert) await waitAdvert(P.device);
       const server = await withTimeout(P.device.gatt.connect(), 12000, '연결 시간 초과 (프린터 전원·거리 확인)');
       let ch = null;
       for (const [s, c] of KNOWN) {
@@ -441,11 +469,12 @@ function connect() {
       }
       if (!ch) throw new Error('프린터 쓰기 채널을 찾지 못함');
       P.ch = ch; P.canResp = !!ch.properties.write; P.canNR = !!ch.properties.writeWithoutResponse;
+      P.stale = false; P.needAdvert = false; P.retryDelay = 1500;
       setStatus('ok', name);
       return true;
     } catch (e) {
-      P.ch = null;
-      setStatus('err', (e && e.message) || '연결 실패');
+      P.ch = null; P.stale = true; P.needAdvert = true;
+      setStatus('err', `${name} 연결 안 됨 — [인쇄]를 누르면 다시 연결`);
       return false;
     } finally {
       P.connecting = null;
@@ -454,37 +483,61 @@ function connect() {
   return P.connecting;
 }
 
+/**
+ * 자동 다시 연결: 끊기면 화면이 켜져 있는 동안 계속 시도 (1.5초 → 3 → 6 … 최대 30초 간격).
+ * 사용자가 '연결 끊기'를 눌렀거나 화면이 꺼져 있으면 쉼 (돌아오면 다시 시작).
+ */
+function scheduleReconnect(first = false) {
+  if (!P.device || P.userClosed || isConnected() || document.hidden) return;
+  if (first) { P.retryDelay = 1500; clearTimeout(P.retryTimer); P.retryPending = false; }
+  if (P.retryPending) return;
+  P.retryPending = true;
+  P.retryTimer = setTimeout(async () => {
+    P.retryPending = false;
+    if (!P.device || P.userClosed || isConnected() || document.hidden) return;
+    if (printing) { scheduleReconnect(); return; }
+    if (await connect()) return;
+    P.retryDelay = Math.min(P.retryDelay * 2, 30000);
+    scheduleReconnect();
+  }, P.retryDelay);
+}
+
 function onDisconnected() {
   P.ch = null;
   if (manualClose) { manualClose = false; setStatus('', '연결 끊음 — 눌러서 연결'); return; }
-  setStatus('busy', '끊김 — 다시 연결 중');
-  reconnectLater();
-}
-/** 저절로 끊기면 미리 다시 붙여 둠 → 인쇄 누를 때 연결 대기 없음 (3번까지) */
-async function reconnectLater() {
-  for (let a = 1; a <= 3; a++) {
-    await sleep(1500 * a);
-    if (isConnected()) return;
-    if (await connect()) return;
-  }
+  P.needAdvert = true;
+  setStatus('busy', `${devName()} 끊김 — 다시 연결 중`);
+  scheduleReconnect(true);
 }
 function disconnect() {
+  P.userClosed = true; clearTimeout(P.retryTimer); P.retryPending = false;
   if (P.device && P.device.gatt && P.device.gatt.connected) { manualClose = true; P.device.gatt.disconnect(); }
   P.ch = null;
   setStatus('', '연결 끊음 — 눌러서 연결');
 }
+/** 메뉴의 '다시 연결': 붙일 수 있으면 붙이고, 안 되는 상태면 고르기 창(그 프린터만) */
+function userReconnect() {
+  P.userClosed = false;
+  if (!P.device || P.stale) return pickPrinter(false);
+  P.ch = null;
+  return connect();
+}
 
-/** 지난번 프린터 자동 연결 (브라우저가 '허용한 기기 목록'을 지원할 때만) */
+/**
+ * 지난번 프린터 다시 붙이기 — 페이지를 열 때 / 다시 돌아왔을 때.
+ * 페이지가 열려 있는 동안 받은 기기가 있으면 그걸로, 없으면 브라우저의 '허용한 기기 목록'(getDevices, 지원할 때만)에서 찾음.
+ */
 async function restoreDevice() {
   if (!bleSupported()) { showNoBle(false); return; }
-  const idle = S.deviceName ? `${S.deviceName} — 눌러서 연결` : '프린터 연결 안 됨';
-  if (!navigator.bluetooth.getDevices || !S.deviceId) { setStatus('', idle); return; }
+  if (P.device) { if (!isConnected() && !P.userClosed) scheduleReconnect(true); return; }
+  const idle = S.deviceName ? `${S.deviceName} — [인쇄]를 누르면 연결` : '프린터 연결 안 됨';
+  if (!navigator.bluetooth.getDevices || (!S.deviceId && !S.deviceName)) { setStatus('', idle); return; }
   try {
     const devs = await navigator.bluetooth.getDevices();
-    const d = devs.find(x => x.id === S.deviceId);
+    const d = devs.find(x => S.deviceId && x.id === S.deviceId) || devs.find(x => S.deviceName && x.name === S.deviceName);
     if (!d) { setStatus('', idle); return; }
-    attachDevice(d);
-    if (!(await connect())) setStatus('', idle);
+    attachDevice(d); P.needAdvert = true;
+    if (!(await connect())) scheduleReconnect(true);
   } catch (_) { setStatus('', idle); }
 }
 
@@ -539,11 +592,18 @@ async function sendJob(bytes) {
   }
 }
 
-/** 인쇄 전에: 프린터가 없으면 고르기(사용자가 버튼을 누른 그 순간에만 가능), 있으면 연결 */
+/**
+ * 인쇄 전에: 연결돼 있으면 바로, 아니면 다시 붙이기.
+ * 프린터가 없거나 다시 붙이기에 실패한 상태면 누른 지금 바로 고르기 창 (한 번 연결했던 프린터만 떠서 한 번에 선택).
+ */
 async function ensurePrinter() {
   if (!bleSupported()) { showNoBle(); return false; }
-  if (!P.device) return pickPrinter();
-  return connect();
+  if (isConnected()) return true;
+  P.userClosed = false;
+  if (!P.device || P.stale) return pickPrinter(false);
+  if (await connect()) return true;
+  toast('프린터에 연결하지 못했습니다 — [인쇄]를 한 번 더 누르면 프린터를 다시 고릅니다');
+  return false;
 }
 
 // ═══════════════════════════ 상태 ═══════════════════════════
@@ -1249,8 +1309,8 @@ function loadRecord(rec, from) {
 function printerMenu() {
   if (!bleSupported()) { showNoBle(); return; }
   listSheet('프린터', [
-    { label: P.device ? '다른 프린터 찾기' : '프린터 찾기', onClick: () => pickPrinter() },
-    { label: '다시 연결', onClick: () => { if (P.device) { P.ch = null; connect(); } else pickPrinter(); } },
+    { label: '다시 연결', onClick: () => userReconnect() },
+    { label: S.deviceName ? '다른 프린터 찾기' : '프린터 찾기', onClick: () => pickPrinter(true) },
     { label: '연결 끊기', onClick: disconnect },
     { label: '프린터 설정', onClick: settingsSheet },
   ]);
@@ -1275,7 +1335,7 @@ function settingsSheet() {
     switchRow('출력 방향 180° 뒤집기', S.flip180, v => { S.flip180 = v; saveS(); }),
     sec('연결'),
     h('div', { class: 'row' },
-      btn(P.device ? '다른 프린터 찾기' : '프린터 찾기', 'tonal', () => pickPrinter()),
+      btn(S.deviceName ? '다른 프린터 찾기' : '프린터 찾기', 'tonal', () => pickPrinter(true)),
       btn('연결 끊기', 'outline', disconnect)),
     sec('블루투스 전송'),
     field('확인 간격 — 1 안전 · 4 기본 · 클수록 빠름', num('syncEvery')),
@@ -1428,6 +1488,12 @@ function wire() {
   $('#cancel').addEventListener('click', () => { cancelReq = true; });
 
   window.addEventListener('resize', () => { if (tpl) { fitPaper(); drawSel(); } });
+  // 다른 앱 갔다가 돌아오거나 화면을 다시 켜면 바로 다시 붙이기
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) restoreDevice(); });
+  window.addEventListener('pageshow', () => restoreDevice());
+  window.addEventListener('focus', () => restoreDevice());
+  // 화면이 켜져 있는 동안 20초마다 점검 (끊김 이벤트를 놓친 경우 대비)
+  setInterval(() => { if (!document.hidden && P.device && !isConnected() && !P.connecting && !P.userClosed && !printing) scheduleReconnect(); }, 20000);
 }
 
 function init() {
