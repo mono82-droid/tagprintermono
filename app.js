@@ -318,23 +318,8 @@ function center(t, e, hz, vt, n = 1, fit = n) {
 
 const enc = new TextEncoder();
 
-/**
- * 라벨 1장 작업. BITMAP 은 잉크가 있는 영역만 잘라 보내 전송량을 줄임.
- * TSPL BITMAP: 1 = 흰 점, 0 = 검은 점, MSB = 왼쪽 픽셀.
- * header=false 면 용지 설정(SIZE~SPEED)을 생략 → 연속 인쇄 때 첫 장에만.
- */
-function tsplJob(t, cv, copies, header = true) {
-  const parts = [];
-  const cmd = s => parts.push(enc.encode(s + '\r\n'));
-  if (header) {
-    cmd(`SIZE ${t.widthMm} mm,${t.heightMm} mm`);
-    cmd(`GAP ${t.gapMm} mm,0 mm`);
-    cmd(`DIRECTION ${S.flip180 ? 1 : 0}`);
-    cmd('REFERENCE 0,0');
-    cmd(`DENSITY ${S.density}`);
-    cmd(`SPEED ${S.speed}`);
-  }
-  cmd('CLS');
+/** 캔버스 → 검은 점 + 잉크가 있는 영역 */
+function inkOf(cv) {
   const w = cv.width, hh = cv.height;
   const d = cv.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, hh).data;
   const black = new Uint8Array(w * hh);
@@ -349,30 +334,94 @@ function tsplJob(t, cv, copies, header = true) {
       }
     }
   }
-  if (maxX >= 0) {
-    const bx0 = minX >> 3, wb = (maxX >> 3) - bx0 + 1, rows = maxY - minY + 1;
-    const posX = Math.max(0, bx0 * 8 + int(S.offsetX)), posY = Math.max(0, minY + int(S.offsetY));
-    parts.push(enc.encode(`BITMAP ${posX},${posY},${wb},${rows},0,`));
-    const bmp = new Uint8Array(wb * rows);
-    for (let y = minY; y <= maxY; y++) {
-      for (let b = 0; b < wb; b++) {
-        let v = 0xFF;
-        for (let bit = 0; bit < 8; bit++) {
-          const x = (bx0 + b) * 8 + bit;
-          if (x < w && black[y * w + x]) v &= ~(0x80 >> bit);
-        }
-        bmp[(y - minY) * wb + b] = v & 0xFF;
-      }
-    }
-    parts.push(bmp);
-    parts.push(enc.encode('\r\n'));
-  }
-  cmd(`PRINT 1,${copies}`);
+  return { w, h: hh, black, minX, maxX, minY, maxY };
+}
+const joinBytes = parts => {
   let len = 0; for (const p of parts) len += p.length;
   const out = new Uint8Array(len); let o = 0;
   for (const p of parts) { out.set(p, o); o += p.length; }
   return out;
+};
+function tsplHeader(t, parts) {
+  const cmd = s => parts.push(enc.encode(s + '\r\n'));
+  cmd(`SIZE ${t.widthMm} mm,${t.heightMm} mm`);
+  cmd(`GAP ${t.gapMm} mm,0 mm`);
+  cmd(`DIRECTION ${S.flip180 ? 1 : 0}`);
+  cmd('REFERENCE 0,0');
+  cmd(`DENSITY ${S.density}`);
+  cmd(`SPEED ${S.speed}`);
 }
+/** BITMAP 명령 하나: 바이트 열 bx0부터 wb개, 줄 y0..y1 을 (posX,posY)에 */
+function tsplBitmap(k, bx0, wb, y0, y1, posX, posY, parts) {
+  const rows = y1 - y0 + 1;
+  parts.push(enc.encode(`BITMAP ${posX},${posY},${wb},${rows},0,`));
+  const bmp = new Uint8Array(wb * rows);
+  for (let y = y0; y <= y1; y++) {
+    for (let b = 0; b < wb; b++) {
+      let v = 0xFF;
+      for (let bit = 0; bit < 8; bit++) {
+        const x = (bx0 + b) * 8 + bit;
+        if (x < k.w && k.black[y * k.w + x]) v &= ~(0x80 >> bit);
+      }
+      bmp[(y - y0) * wb + b] = v & 0xFF;
+    }
+  }
+  parts.push(bmp);
+  parts.push(enc.encode('\r\n'));
+}
+
+/**
+ * 라벨 1장 작업. BITMAP 은 잉크가 있는 영역만 잘라 보내 전송량을 줄임.
+ * TSPL BITMAP: 1 = 흰 점, 0 = 검은 점, MSB = 왼쪽 픽셀.
+ * header=false 면 용지 설정(SIZE~SPEED)을 생략 → 연속 인쇄 때 첫 장에만.
+ * print=false 면 '찍어'(PRINT) 없이 그림만 → 미리 보내기 비교용.
+ */
+function tsplJobInk(t, k, copies, header = true, print = true) {
+  const parts = [];
+  if (header) tsplHeader(t, parts);
+  parts.push(enc.encode('CLS\r\n'));
+  if (k.maxX >= 0) {
+    const bx0 = k.minX >> 3, wb = (k.maxX >> 3) - bx0 + 1;
+    const posX = Math.max(0, bx0 * 8 + int(S.offsetX)), posY = Math.max(0, k.minY + int(S.offsetY));
+    tsplBitmap(k, bx0, wb, k.minY, k.maxY, posX, posY, parts);
+  }
+  if (print) parts.push(enc.encode(`PRINT 1,${copies}\r\n`));
+  return joinBytes(parts);
+}
+const tsplJob = (t, cv, copies, header = true, print = true) => tsplJobInk(t, inkOf(cv), copies, header, print);
+
+/**
+ * 미리 보내기용: 같은 그림을 [용지 설정+CLS] + 띠(bandRows 줄씩) 여러 BITMAP 으로 나눔.
+ * 띠 사이에서는 언제든 멈출 수 있음 (명령이 다 끝난 상태라 프린터가 꼬이지 않고, 다음 작업의 CLS 가 지움).
+ * 찍히는 모양은 tsplJob 과 점 하나까지 같음.
+ */
+function tsplBandsInk(t, k, bandRows = 32) {
+  const head = []; tsplHeader(t, head); head.push(enc.encode('CLS\r\n'));
+  const out = [joinBytes(head)];
+  if (k.maxX < 0) return out;
+  const gbx0 = k.minX >> 3;
+  const gPosX = Math.max(0, gbx0 * 8 + int(S.offsetX)), gPosY = Math.max(0, k.minY + int(S.offsetY));
+  for (let y = k.minY; y <= k.maxY; y += bandRows) {
+    const yEnd = Math.min(y + bandRows - 1, k.maxY);
+    let bMinX = k.w, bMaxX = -1, bMinY = -1, bMaxY = -1;
+    for (let yy = y; yy <= yEnd; yy++) {
+      for (let x = 0; x < k.w; x++) {
+        if (k.black[yy * k.w + x]) {
+          if (x < bMinX) bMinX = x; if (x > bMaxX) bMaxX = x;
+          if (bMinY < 0) bMinY = yy; bMaxY = yy;
+        }
+      }
+    }
+    if (bMaxX < 0) continue;   // 빈 띠는 건너뜀
+    const bx0 = bMinX >> 3, wb = (bMaxX >> 3) - bx0 + 1, parts = [];
+    tsplBitmap(k, bx0, wb, bMinY, bMaxY, gPosX + (bx0 - gbx0) * 8, gPosY + (bMinY - k.minY), parts);
+    out.push(joinBytes(parts));
+  }
+  return out;
+}
+/** 미리 넣어 둔 그림을 찍기만 하는 명령 (몇 바이트) */
+const printOnly = copies => enc.encode(`PRINT 1,${copies}\r\n`);
+const eqBytes = (a, b) => { if (!a || !b || a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
 
 // ═══════════════════════════ 프린터 (Web Bluetooth) ═══════════════════════════
 
@@ -382,6 +431,7 @@ const P = {
   needAdvert: false,   // 오래 끊겨 있던 기기: 광고 신호를 먼저 받아야 붙는 브라우저가 있음
   userClosed: false,   // 사용자가 '연결 끊기'를 누름 → 자동 연결 안 함
   retryTimer: 0, retryPending: false, retryDelay: 1500,
+  connId: 0,           // 연결할 때마다 +1 → 미리 보낸 그림이 '같은 연결'에서 보낸 건지 확인
 };
 let manualClose = false;
 
@@ -470,7 +520,9 @@ function connect() {
       if (!ch) throw new Error('프린터 쓰기 채널을 찾지 못함');
       P.ch = ch; P.canResp = !!ch.properties.write; P.canNR = !!ch.properties.writeWithoutResponse;
       P.stale = false; P.needAdvert = false; P.retryDelay = 1500;
+      P.connId++;
       setStatus('ok', name);
+      schedulePreload(300);   // 연결되면 지금 라벨을 프린터에 미리 넣어 둠
       return true;
     } catch (e) {
       P.ch = null; P.stale = true; P.needAdvert = true;
@@ -503,7 +555,7 @@ function scheduleReconnect(first = false) {
 }
 
 function onDisconnected() {
-  P.ch = null;
+  P.ch = null; clearPreload();
   if (manualClose) { manualClose = false; setStatus('', '연결 끊음 — 눌러서 연결'); return; }
   P.needAdvert = true;
   setStatus('busy', `${devName()} 끊김 — 다시 연결 중`);
@@ -571,8 +623,11 @@ async function writeBytes(bytes) {
   }
 }
 
-/** 끊겨 있으면 연결, 실패하면 다시 연결해서 1번 더 */
-async function sendJob(bytes) {
+/**
+ * 끊겨 있으면 연결, 실패하면 다시 연결해서 1번 더.
+ * retryBytes: 다시 연결한 뒤 보낼 것 — 미리 넣은 그림에 '찍어'만 보내다 끊기면 새 연결에선 그림을 믿을 수 없어 전체 라벨로.
+ */
+async function sendJob(bytes, retryBytes = bytes) {
   if (!(await connect())) throw new Error('프린터 연결 안 됨');
   try {
     await writeBytes(bytes);
@@ -588,9 +643,69 @@ async function sendJob(bytes) {
     setStatus('busy', '다시 연결 중');
     await sleep(500);
     if (!(await connect())) throw e;
-    await writeBytes(bytes);
+    await writeBytes(retryBytes);
   }
 }
+
+// ═══════════════════════════ 미리 보내 두기 ═══════════════════════════
+// 고치는 순간 첫 장 그림을 프린터에 넣어 두고, 인쇄를 누르면 '찍어'(PRINT)만 보냄 → 누르자마자 나옴.
+// 프린터는 한 번에 한 기기만 붙으므로 같은 연결이 이어지는 동안엔 그 그림이 그대로 있음.
+// 연결이 바뀌면(끊김·다른 폰·프린터 껐다 켬) 못 믿음 → 그땐 전체 라벨을 보냄.
+
+/** 블루투스 보내기는 한 번에 하나씩 (미리 보내기와 인쇄가 섞이면 안 됨) */
+let ioTail = Promise.resolve();
+function io(fn) { const run = ioTail.then(fn, fn); ioTail = run.catch(() => {}); return run; }
+
+const PL = { body: null, key: null, connId: -1, inflightKey: null, inflightBody: null, seq: 0, req: 0, timer: 0 };
+const imgKey = (t, n, fit) => prepKey(t, n, fit, 0);   // 장수는 '찍어'에만 들어가므로 뺌
+const isTyping = () => { const a = document.activeElement; return !!a && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && a.type !== 'range')); };
+function schedulePreload(ms) { clearTimeout(PL.timer); PL.timer = setTimeout(preloadNow, ms); }
+function clearPreload() { PL.body = null; PL.key = null; }
+
+/** 이 라벨(첫 장 데이터)의 그림이 지금 프린터에 들어가 있나 — 그림 바이트로 비교, 같은 연결일 때만 */
+function preloadedFor(job, copies) {
+  if (!PL.body || PL.connId !== P.connId || !isConnected()) return false;
+  const tail = printOnly(copies), n = job.length - tail.length;
+  if (n !== PL.body.length) return false;
+  for (let i = 0; i < tail.length; i++) if (job[n + i] !== tail[i]) return false;
+  for (let i = 0; i < n; i++) if (job[i] !== PL.body[i]) return false;
+  return true;
+}
+
+async function preloadNow() {
+  if (document.hidden || printing || !tpl || !isConnected()) return;
+  const t = clone(tpl);
+  let n = 0, fit = 0;
+  if (hasSerial()) { const r = planned(); if (!r) return; [n, fit] = r; }
+  const key = imgKey(t, n, fit);
+  if (PL.body && PL.key === key && PL.connId === P.connId) return;   // 이미 들어가 있음
+  if (PL.inflightKey === key) return;                                // 지금 보내는 중
+  const req = ++PL.req;
+  await ensureFonts(t);
+  if (req !== PL.req || printing) return;   // 그 사이 또 고침 → 최신 것만
+  const k = inkOf(render(t, n, fit));
+  const body = tsplJobInk(t, k, 1, true, false);   // 비교용 (인쇄 첫 장과 같은 바이트)
+  const parts = tsplBandsInk(t, k);                // 실제로 보내는 건 띠로 나눈 것
+  if (eqBytes(PL.inflightBody, body)) return;      // 보내는 중인 것과 같은 그림
+  const seq = ++PL.seq;                            // 보내는 중인 다른 그림은 다음 띠에서 멈춤
+  io(async () => {
+    if (seq !== PL.seq || printing || !isConnected()) return;
+    if (PL.body && PL.connId === P.connId && eqBytes(PL.body, body)) return;
+    clearPreload();
+    const cid = P.connId;
+    PL.inflightKey = key; PL.inflightBody = body;
+    try {
+      for (const part of parts) {
+        if (seq !== PL.seq || !isConnected() || P.connId !== cid) return;   // 띠 사이에서 멈춤
+        await writeBytes(part);
+      }
+      if (isConnected() && P.connId === cid) { PL.body = body; PL.key = key; PL.connId = cid; }
+    } catch (_) { /* 끊김 등 — 인쇄 때 전체 라벨을 보냄 */ }
+    finally { PL.inflightKey = null; PL.inflightBody = null; }
+  });
+}
+/** 인쇄 누름: 보내는 중인 미리 보내기가 다른 그림이면 다음 띠에서 멈추게 (같은 그림이면 마저 보내고 바로 찍음) */
+function stopOtherPreload(key) { if (PL.inflightKey && PL.inflightKey !== key) PL.seq++; }
 
 /**
  * 인쇄 전에: 연결돼 있으면 바로, 아니면 다시 붙이기.
@@ -644,8 +759,9 @@ const previewFit = () => Math.max(S.nextNumber, fitNum());
 // ═══════════════════════════ 첫 장 미리 만들기 ═══════════════════════════
 
 let prepared = null, prepTimer = 0;
+const dateStamp = t => t.elements.filter(e => e.type === 'DATE').map(e => fmtDate(e.dateFmt)).join(',');
 const prepKey = (t, n, fit, copies) =>
-  `${JSON.stringify(t)}|${n}|${fit}|${copies}|${S.density}|${S.speed}|${S.flip180}|${S.offsetX}|${S.offsetY}`;
+  `${JSON.stringify(t)}|${n}|${fit}|${copies}|${S.density}|${S.speed}|${S.flip180}|${S.offsetX}|${S.offsetY}|${dateStamp(t)}`;
 function schedulePrepare() { clearTimeout(prepTimer); prepTimer = setTimeout(prepareFirst, 300); }
 async function prepareFirst() {
   if (printing || !tpl) return;
@@ -653,6 +769,7 @@ async function prepareFirst() {
   let n = 0, fit = 0, copies = 1;
   if (hasSerial()) { const r = planned(); if (!r) return; [n, fit] = r; copies = S.copies; }
   const key = prepKey(t, n, fit, copies);
+  schedulePreload(isTyping() ? 1200 : 0);   // 고치자마자 프린터로 미리 보냄 (입력칸에서 타자 중엔 손 뗀 뒤)
   if (prepared && prepared.key === key) return;
   await ensureFonts(t);
   prepared = { key, job: tsplJob(t, render(t, n, fit), copies, true) };
@@ -968,7 +1085,10 @@ function editInline(e) {
   }
   openSheet(`${TITLE[e.type]} 수정`, body, [
     btn('취소', 'outline', () => { closeSheet(true); }),
-    btn('확인', 'primary', () => { closeSheet(); saveTpl(); buildProps(); refreshNumbers(); updatePrintUI(); renderTabs(); }),
+    btn('확인', 'primary', () => {
+      closeSheet(); saveTpl(); buildProps(); refreshNumbers(); updatePrintUI(); renderTabs();
+      clearTimeout(prepTimer); prepareFirst();   // 확인 누르는 순간 프린터로 미리 보내기 시작
+    }),
   ], restore);
   if (first) { first.focus(); if (first.select && e.type !== 'TEXT') first.select(); }
 }
@@ -1165,6 +1285,7 @@ async function startPrint() {
   const [start, endN] = r, count = endN - start + 1, fit = endN, copies = S.copies;
   const t = clone(tpl);   // 인쇄 중 편집해도 영향 없게
   printing = true; cancelReq = false; setBusy(true);
+  stopOtherPreload(imgKey(t, start, fit));
   await ensureFonts(t);
   // 연속 인쇄: 보내는 동안 다음 라벨을 미리 그려 둠(최대 3장 앞서) → 장 사이에 쉬지 않음
   const queue = []; let stop = false;
@@ -1178,14 +1299,20 @@ async function startPrint() {
       await sleep(0);
     }
   })();
-  let done = 0, err = null, bytes = 0;
+  let done = 0, err = null, bytes = 0, usedPre = false;
   const t0 = performance.now();
   try {
     for (let i = 0; i < count; i++) {
       if (cancelReq) break;
       while (!queue.length) await sleep(2);
       const [n, job] = queue.shift();
-      await sendJob(job);
+      let pre = false;
+      await io(async () => {
+        if (i === 0) { pre = preloadedFor(job, copies); clearPreload(); }   // 이제부터 프린터 그림이 바뀜
+        if (pre) await sendJob(printOnly(copies), job);
+        else await sendJob(job);
+      });
+      if (pre) usedPre = true;
       bytes = job.length;
       S.nextNumber = n + 1; saveS();          // 한 장 보낼 때마다 저장 → 끊겨도 이어서 인쇄
       lastPrinted = n; lastFit = fit; done++;
@@ -1198,7 +1325,8 @@ async function startPrint() {
   const left = Math.max(0, S.rangeEnd - S.nextNumber + 1);
   if (err) setProgress(`⚠ ${done}/${count}장 보낸 뒤 중단: ${err}\n인쇄를 다시 누르면 ${S.nextNumber}번부터 이어서 나옵니다`);
   else if (cancelReq) setProgress(`중지됨 — ${done}/${count}장 보냄 (다음 ${S.nextNumber}번)`);
-  else setProgress(`완료 — ${start} ~ ${start + done - 1} (${done}장) · 남은 번호 ${left}개\n전송 ${((performance.now() - t0) / 1000).toFixed(1)}초 (장당 ${(bytes / 1024).toFixed(1)}KB)`);
+  else setProgress(`완료 — ${start} ~ ${start + done - 1} (${done}장) · 남은 번호 ${left}개\n전송 ${((performance.now() - t0) / 1000).toFixed(1)}초 (장당 ${(bytes / 1024).toFixed(1)}KB)` +
+    (usedPre ? ' · 미리 보낸 그림으로 바로 인쇄' : ''));
   setBusy(false); refreshNumbers(); redraw();
 }
 
@@ -1206,15 +1334,21 @@ async function startPrint() {
 async function printTextLabel() {
   const t = clone(tpl);
   printing = true; cancelReq = false; setBusy(true);
-  let err = null;
+  stopOtherPreload(imgKey(t, 0, 0));
+  let err = null, pre = false;
   try {
     await ensureFonts(t);
     const job = takePrepared(t, 0, 0, 1) || tsplJob(t, render(t, 0), 1, true);
-    await sendJob(job);
+    await io(async () => {
+      pre = preloadedFor(job, 1); clearPreload();   // 찍은 뒤엔 다시 넣어 둠 (찍고 나서도 그림을 갖고 있는지는 장담 못 해서)
+      if (pre) await sendJob(printOnly(1), job);
+      else await sendJob(job);
+    });
     history.add({ time: Date.now(), template: t, from: 0, to: 0, copies: 1 });
   } catch (e) { err = (e && e.message) || '인쇄 실패'; }
   printing = false; setBusy(false);
-  setProgress(err ? `⚠ ${err}` : '인쇄함');
+  setProgress(err ? `⚠ ${err}` : (pre ? '인쇄함 · 미리 보낸 그림으로 바로 인쇄' : '인쇄함'));
+  updatePrintUI();   // 다음 것을 다시 미리 넣어 둠
 }
 
 async function printOnce(n, fit) {
@@ -1222,8 +1356,13 @@ async function printOnce(n, fit) {
   if (!(await ensurePrinter())) return;
   const t = clone(tpl), f = Math.max(n, fit ?? fitNum());
   printing = true; setBusy(true);
+  PL.seq++;   // 다른 그림을 찍으니 보내는 중인 미리 보내기는 멈춤
   let err = null;
-  try { await ensureFonts(t); await sendJob(tsplJob(t, render(t, n, f), 1, true)); }
+  try {
+    await ensureFonts(t);
+    const job = tsplJob(t, render(t, n, f), 1, true);
+    await io(async () => { clearPreload(); await sendJob(job); });
+  }
   catch (e) { err = (e && e.message) || '인쇄 실패'; }
   printing = false; setBusy(false);
   setProgress(err ? `⚠ ${err}` : `${n} 인쇄함`);
@@ -1489,7 +1628,9 @@ function wire() {
 
   window.addEventListener('resize', () => { if (tpl) { fitPaper(); drawSel(); } });
   // 다른 앱 갔다가 돌아오거나 화면을 다시 켜면 바로 다시 붙이기
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) restoreDevice(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { restoreDevice(); schedulePreload(300); } });
+  // 날짜·시간 요소가 있으면 30초마다 글자가 바뀌었는지 확인 → 바뀌었으면 다시 준비·미리 넣기
+  setInterval(() => { if (!document.hidden && tpl && tpl.elements.some(e => e.type === 'DATE')) schedulePrepare(); }, 30000);
   window.addEventListener('pageshow', () => restoreDevice());
   window.addEventListener('focus', () => restoreDevice());
   // 화면이 켜져 있는 동안 20초마다 점검 (끊김 이벤트를 놓친 경우 대비)
