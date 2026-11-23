@@ -304,7 +304,8 @@ function render(t, n, fit = n, cv) {
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
-  t.elements.forEach(e => drawElement(ctx, t, e, n, fit));
+  const skip = (ip && t === tpl && cv.id === 'label') ? ip.idx : -1;
+  t.elements.forEach((e, i) => { if (i !== skip) drawElement(ctx, t, e, n, fit); });
   return cv;
 }
 
@@ -796,10 +797,12 @@ function recordUndo() {
 function resetUndo() { undoStack.length = 0; redoStack.length = 0; lastSnap = JSON.stringify(tpl); lastPushAt = 0; undoButtons(); }
 function undoButtons() { $('#undo').disabled = !undoStack.length; $('#redo').disabled = !redoStack.length; }
 function undo() {
+  if (ip) finishInPlace(true);
   if (!undoStack.length) return;
   redoStack.push(JSON.stringify(tpl)); restoreSnap(undoStack.pop()); toast('되돌림');
 }
 function redo() {
+  if (ip) finishInPlace(true);
   if (!redoStack.length) return;
   undoStack.push(JSON.stringify(tpl)); restoreSnap(redoStack.pop()); toast('다시 함');
 }
@@ -813,6 +816,7 @@ function restoreSnap(json) {
 }
 
 function switchTo(t) {
+  if (ip) finishInPlace(true);
   tpl = t; S.current = t.name;
   if (!S.tabOrder.includes(t.name)) S.tabOrder.push(t.name);
   saveS(); store.save(tpl);
@@ -1042,8 +1046,103 @@ cv.addEventListener('click', ev => {
 });
 
 // ═══════════════════════════ 글자 바로 수정 ═══════════════════════════
+// 글자를 누르면 창을 띄우지 않고 라벨 위 그 자리에 커서가 뜸 → 바로 고침.
+// 다른 곳을 누르거나 키보드 완료/엔터면 저장, [✕ 취소]면 원래대로. (날짜·돌린 글자는 기존 수정 창)
 
-function editInline(e) {
+let ip = null;   // 고치는 중: { e, idx, el, multi, backup, bNext, bStart, bEnd }
+const canInPlace = e => (e.type === 'TEXT' || e.type === 'SERIAL') && !(e.rotation % 360);
+
+function editInline(e) { return canInPlace(e) ? editInPlace(e) : editSheet(e); }
+
+/** "7-404" 처럼 통째로 입력 → 끝의 숫자가 다음 번호, 앞뒤는 앞글자·뒷글자 */
+function applySerialText(e, v) {
+  const m = /^(.*?)(\d+)(\D*)$/.exec(v);
+  if (!m) { e.prefix = v; e.suffix = ''; return; }
+  e.prefix = m[1]; e.suffix = m[3];
+  e.digits = (m[2].length > 1 && m[2].startsWith('0')) ? m[2].length : 0;
+  const n = int(m[2], S.nextNumber);
+  S.nextNumber = n;
+  if (n < S.rangeStart) S.rangeStart = n;
+  if (n > S.rangeEnd) S.rangeEnd = n + 999;
+  saveS();
+}
+const serialHint = e => '인쇄하면: ' + [0, 1, 2].map(i => content(e, S.nextNumber + i)).join(', ') + ' …';
+
+function editInPlace(e) {
+  if (ip) finishInPlace(true);
+  const multi = e.type === 'TEXT';
+  const el = document.createElement(multi ? 'textarea' : 'input');
+  el.className = 'inplace' + (e.invert ? ' inv' : '');
+  for (const [k, v] of [['autocomplete', 'off'], ['autocorrect', 'off'], ['autocapitalize', 'off'], ['spellcheck', 'false']]) el.setAttribute(k, v);
+  if (!multi) { el.type = 'text'; el.setAttribute('enterkeyhint', 'done'); }
+  el.value = multi ? e.text : content(e, S.nextNumber);
+  ip = { e, idx: tpl.elements.indexOf(e), el, multi, backup: JSON.stringify(e), bNext: S.nextNumber, bStart: S.rangeStart, bEnd: S.rangeEnd };
+  $('#paper').append(el);
+  $('#ipBar').hidden = false;
+  redraw();          // 캔버스에선 이 글자를 빼고 (입력칸이 그 자리에)
+  placeInPlace();
+  el.addEventListener('input', () => {
+    if (!ip || ip.el !== el) return;
+    if (multi) e.text = el.value; else applySerialText(e, el.value);
+    if (!multi) { refreshNumbers(); setProgress(serialHint(e)); }
+    redraw(); placeInPlace();
+  });
+  el.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' && !multi) { ev.preventDefault(); finishInPlace(true); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); finishInPlace(false); }
+  });
+  el.addEventListener('blur', () => { if (ip && ip.el === el) finishInPlace(true); });
+  el.focus({ preventScroll: true });   // 누른 그 순간에 해야 아이폰 키보드가 뜸
+  const L = el.value.length; try { el.setSelectionRange(L, L); } catch (_) {}
+  if (!multi) setProgress(serialHint(e));
+}
+
+/** 입력칸을 캔버스 글자와 같은 자리·글꼴·크기로 (글자가 길어져 줄면 같이 줄어듦) */
+function placeInPlace() {
+  if (!ip) return;
+  const { e, el, multi } = ip, k = scale, W = tpl.widthMm * DOTS;
+  const L = layout(tpl, e, S.nextNumber, previewFit()), m = L.m;
+  const px = L.px * k, spec = fontSpec(e, px);
+  mctx.font = spec.css;
+  const fm = mctx.measureText('Hg가');
+  const A = fm.fontBoundingBoxAscent || px * 0.92, D = fm.fontBoundingBoxDescent || px * 0.24, lh = A + D;
+  const r0 = m.rects[0] || { a: L.px * 0.8 };
+  const base0 = (L.y + m.pad + (m.tops[0] || 0) + r0.a) * k;   // 첫 줄 기준선 (캔버스와 같은 자리)
+  let left, width, align;
+  if (e.centerH && (!multi || e.align === 1)) { left = 0; width = W * k; align = 'center'; }
+  else {
+    align = ['left', 'center', 'right'][e.align] || 'left';
+    const slack = px;   // 화면 글자와 캔버스 글자 폭이 조금 달라도 안 잘리게
+    width = (L.bw - m.pad * 2) * k + slack;
+    left = (L.x + m.pad) * k - (align === 'center' ? slack / 2 : align === 'right' ? slack : 0);
+  }
+  const lines = Math.max(1, el.value.split('\n').length);
+  Object.assign(el.style, {
+    font: spec.css, lineHeight: lh + 'px', textAlign: align,
+    left: left + 'px', width: width + 'px', top: (base0 - A) + 'px', height: (lh * lines + 2) + 'px',
+    transform: m.sx !== 1 ? `scaleX(${m.sx})` : '', transformOrigin: align === 'center' ? '50% 0' : align === 'right' ? '100% 0' : '0 0',
+    webkitTextStroke: spec.fakeBold ? `${m.fb * 2 * k}px` : '',
+  });
+}
+
+function finishInPlace(commit) {
+  if (!ip) return;
+  const cur = ip; ip = null;
+  cur.el.remove();
+  $('#ipBar').hidden = true;
+  if (commit) {
+    saveTpl(); buildProps(); refreshNumbers(); renderTabs();
+  } else {
+    Object.assign(cur.e, JSON.parse(cur.backup));
+    S.nextNumber = cur.bNext; S.rangeStart = cur.bStart; S.rangeEnd = cur.bEnd; saveS();
+    refreshNumbers();
+  }
+  setProgress('', false); updatePrintUI();
+  redraw();
+  clearTimeout(prepTimer); prepareFirst();   // 끝나는 순간 프린터로 미리 보내기 시작
+}
+
+function editSheet(e) {
   const backup = JSON.stringify(e), bNext = S.nextNumber, bStart = S.rangeStart, bEnd = S.rangeEnd;
   const restore = () => {
     Object.assign(e, JSON.parse(backup));
@@ -1062,20 +1161,7 @@ function editInline(e) {
     const inp = h('input', { class: 'field', value: content(e, S.nextNumber), autocomplete: 'off' });
     const hint = h('div', { class: 'hint', style: 'color:var(--primary)' });
     const showHint = () => { hint.textContent = '인쇄하면: ' + [0, 1, 2].map(i => content(e, S.nextNumber + i)).join(', ') + ' …'; };
-    inp.addEventListener('input', () => {
-      const m = /^(.*?)(\d+)(\D*)$/.exec(inp.value);
-      if (!m) { e.prefix = inp.value; e.suffix = ''; }
-      else {
-        e.prefix = m[1]; e.suffix = m[3];
-        e.digits = (m[2].length > 1 && m[2].startsWith('0')) ? m[2].length : 0;
-        const n = int(m[2], S.nextNumber);
-        S.nextNumber = n;
-        if (n < S.rangeStart) S.rangeStart = n;
-        if (n > S.rangeEnd) S.rangeEnd = n + 999;
-        saveS();
-      }
-      showHint(); redraw();
-    });
+    inp.addEventListener('input', () => { applySerialText(e, inp.value); showHint(); redraw(); });
     add('시작 태그 (예: 7-404, A001)', inp);
     body.append(hint); showHint();
   } else {
@@ -1502,6 +1588,7 @@ function showNoBle(open = true) {
 
 let sheetCancel = null;
 function openSheet(title, body, actions, onCancel) {
+  if (ip) finishInPlace(true);
   const sh = $('#sheet');
   sh.innerHTML = '';
   sh.append(h('div', { class: 'grab' }), title ? h('h2', {}, title) : null, body);
@@ -1626,7 +1713,10 @@ function wire() {
   $('#reprint').addEventListener('click', () => { if (lastPrinted >= 0) printOnce(lastPrinted, lastFit); });
   $('#cancel').addEventListener('click', () => { cancelReq = true; });
 
-  window.addEventListener('resize', () => { if (tpl) { fitPaper(); drawSel(); } });
+  window.addEventListener('resize', () => { if (tpl) { fitPaper(); drawSel(); placeInPlace(); } });
+  // 바로 고치기: [✕ 취소] [✓ 완료] — 누르는 순간 처리 (입력칸 포커스가 먼저 빠지지 않게)
+  $('#ipCancel').addEventListener('pointerdown', ev => { ev.preventDefault(); finishInPlace(false); });
+  $('#ipDone').addEventListener('pointerdown', ev => { ev.preventDefault(); finishInPlace(true); });
   // 다른 앱 갔다가 돌아오거나 화면을 다시 켜면 바로 다시 붙이기
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { restoreDevice(); schedulePreload(300); } });
   // 날짜·시간 요소가 있으면 30초마다 글자가 바뀌었는지 확인 → 바뀌었으면 다시 준비·미리 넣기

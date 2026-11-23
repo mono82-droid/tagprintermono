@@ -78,6 +78,20 @@ h1 { flex: 1; margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.2p
   border-radius: 14px; padding: 6px 10px; font-size: 12px; font-weight: 700; color: var(--text); cursor: pointer;
 }
 .sizechip:active { background: var(--primary-soft); }
+/* ── 라벨 위에서 바로 고치기: 캔버스 글자 자리에 겹쳐 놓는 입력칸 */
+.inplace {
+  position: absolute; margin: 0; padding: 0; border: 0; outline: none; resize: none; overflow: hidden;
+  background: transparent; color: #000; caret-color: var(--primary); white-space: pre; z-index: 2;
+  -webkit-appearance: none; appearance: none; border-radius: 0; box-sizing: content-box;
+}
+.inplace.inv { background: #000; color: #fff; caret-color: #fff; }
+#ipBar { position: absolute; top: 8px; right: 10px; display: flex; gap: 6px; z-index: 3; }
+#ipBar[hidden] { display: none; }
+#ipBar button {
+  border: 1px solid var(--line); background: rgba(255,255,255,.95); border-radius: 14px;
+  padding: 6px 12px; font-size: 13px; font-weight: 700; color: var(--text);
+}
+#ipBar #ipDone { background: var(--primary); border-color: var(--primary); color: #fff; }
 #sel { position: absolute; border: 2px dashed var(--primary); pointer-events: none; border-radius: 2px; }
 .guide { position: absolute; background: rgba(233,30,99,.5); pointer-events: none; }
 .guide.x { width: 2px; top: 0; bottom: 0; }
